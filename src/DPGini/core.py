@@ -5,7 +5,7 @@ import pandas as pd
 import math
 import random
 
-from utils import sort_X, cal_gini
+from .utils import sort_X, cal_gini
 
 def take_one_out(ind, x):
     x_new = np.delete(x, ind)
@@ -51,7 +51,7 @@ def find_j_star_1d(g, lo, hi):
     best_j = min(range(lo, hi + 1), key=g)
     return best_j
 
-def fast_min_g(x, k):
+def fast_min_gini(x, k):
     """
     O(k log(n-k)) accelerated minimum Gini using correct rank-weighted objective.
     x must be sorted ascending.
@@ -179,6 +179,7 @@ def smooth_upper_bound(beta, x) -> float:
     cand = max(cand_1, cand_2)
     return math.exp(-beta*1)*min(cand, 1)
 
+# Calibrate Smooth Upper Bound
 def cal_su(x, beta, L, U):
     
     best = 0
@@ -194,7 +195,7 @@ def cal_su(x, beta, L, U):
 
     for k in range(1, k_m):
         g_M = fast_max_gini(x, k, L, U)
-        g_m = cal_min_g(x, k)
+        g_m = fast_min_gini(x, k)
         ave_M = cal_max_ave(x, k, U)
         ave_m = cal_min_ave(x, k, L)
 
@@ -324,3 +325,14 @@ def unbounded_quantile_mech(x, q, ell, beta, eps1=0.5, eps2=0.5, i_max=None, see
     if k is None:
         k = i_max - 1
     return (beta**k + ell - 1), k, cutoffs
+
+
+if __name__ == "__main__":
+    x = np.array([10,20,30,40,50,60,70,80,90])
+    x = sort_X(x)
+    L = x[0]
+    U = x[-1]
+    eps = 1.0
+    beta = cal_beta(eps=eps, gamma=2.5)
+    su = cal_su(x, beta, L, U)
+    print("Final Smooth Upper Bound:", su)
