@@ -1,14 +1,18 @@
 from pathlib import Path
+from random import seed
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]   # …/DP_GINI
 sys.path.insert(0, str(ROOT / "src"))
 
+from DPGini.utils import cal_gini, cal_gini, sort_X
+
 import DPGini as dg
 from DPGini.core import (
-    take_one_out, find_j_star, find_j_star_1d, cal_max_ave, cal_min_ave
+    take_one_out, find_j_star, find_j_star_1d, cal_max_ave, cal_min_ave, fast_min_gini, fast_max_gini
 )
 import numpy as np
+import matplotlib.pyplot as plt
 import math
 
 def approx(a, b, tol=1e-9):
@@ -27,12 +31,49 @@ def run():
     # ----- beta -----
     assert approx(dg.cal_beta(1.0, 2.5), 0.4)
 
-    # ----- fast min/max gini -----
-    gmin = dg.fast_min_gini(x5, k=1)
-    gmax = dg.fast_max_gini(x5, k=1, L=L, U=U)
-    assert 0.0 <= gmin <= 1.0
-    assert 0.0 <= gmax <= 1.0
+    # ----- Test fast min/max gini -----
+    n = 10000
+    k = 5
+    alpha = 2
+    seed = 42
+    rng = np.random.default_rng(seed)
+    x = rng.pareto(alpha, size=n) + 1.0
 
+    x = sort_X(x)
+    g_orig = cal_gini(x)
+    g_min = []
+    for k in range(1, 100):
+        g_min.append(fast_min_gini(x, k))       
+    plt.figure(figsize=(7, 4))
+    plt.plot(range(1, 100), g_min, marker="o", ms=3, lw=1)
+    plt.axhline(g_orig, ls="--")
+    plt.xlabel("k  (elements you may replace)")
+    plt.ylabel("Minimum achievable Gini")
+    plt.title(f"Pareto(α=2, n={n})  –  original G={g_orig:.3f}")
+    plt.tight_layout()
+    plt.show()
+
+    g_max_fasten = []
+    for k in range(1, 100):
+        g_max_fasten.append(fast_max_gini(x, k, L, U))
+        print(k)
+
+    x = range(len(g_max_fasten))
+
+    plt.figure(figsize=(8, 5))
+
+    # plt.plot(x, g_max_greedy, marker="o", label="Greedy")
+    plt.plot(x, g_max_fasten, marker="s", label="Fasten")
+
+    plt.title(f"Pareto(α=2, n={n}), k = {k}")
+    plt.xlabel("Iteration")          # or whatever x-axis means in your case
+    plt.ylabel("g_max value")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    
     # ----- smooth upper bound (fast) -----
     beta = dg.cal_beta(1.0, 2.5)
     su_f = dg.cal_su_fast(x5, beta, L, U)

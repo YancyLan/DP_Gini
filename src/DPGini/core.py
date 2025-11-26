@@ -326,6 +326,56 @@ def unbounded_quantile_mech(x, q, ell, beta, eps1=0.5, eps2=0.5, i_max=None, see
         k = i_max - 1
     return (beta**k + ell - 1), k, cutoffs
 
+# Private upper bound
+def laplace(scale):
+    """采样 Laplace(0, scale) 噪声"""
+    u = random.random() - 0.5
+    return -scale * math.copysign(1.0, u) * math.log(1 - 2 * abs(u))
+
+def above_threshold(data, queries, T, Delta, eps1, eps2):
+    # 1. noisy threshold
+    T_hat = T + laplace(Delta / eps1)
+
+    # 2. iterate every query
+    for i, f in enumerate(queries):
+        v_i = laplace(Delta / eps2)            # add noise to the query result
+        if f(data) + v_i >= T_hat:             # if exceeds noisy threshold
+            return i
+    return None
+
+def unbounded_quantile_mech(x, q, ell, beta, eps1=0.5, eps2=0.5, i_max=None, seed=None):
+    """
+    x: data list
+    q: quantile (0~1), e.g., median 0.5
+    ell: known/assumed lower bound ℓ
+    beta: β > 1 (exponential growth factor)
+    eps1, eps2: privacy budgets for AboveThreshold
+    i_max: number of queries to generate (if None, automatically cover up to max(x))
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    n = len(x)
+    T = q * n              # count: qn when q=1, count = n
+
+    Delta = 1.0            # global sensitivity of counting query is 1
+
+    # Automatically determine the number of queries needed (until the right endpoint exceeds max(x))
+    if i_max is None:
+        xmax = max(x)
+        # Need β^i + ℓ - 1 to cover xmax, find the minimum i
+        target = max(1.0, xmax - ell + 1)
+        i_max = max(1, math.ceil(math.log(target, beta)))
+
+    # f_i(x) = |{x_j ∈ x | x_j - ℓ + 1 < β^i}| = count of x_j < β^i + ℓ - 1
+    cutoffs = [beta**i + ell - 1 for i in range(i_max)]
+    queries = [lambda d, c=c: sum(1 for v in d if v < c) for c in cutoffs]
+
+    k = above_threshold(x, queries, T, Delta, eps1, eps2)
+    if k is None:
+        k = i_max - 1
+    return (beta**k + ell - 1), k, cutoffs
+
 
 if __name__ == "__main__":
     x = np.array([10,20,30,40,50,60,70,80,90])
