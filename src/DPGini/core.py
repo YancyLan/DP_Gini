@@ -276,7 +276,6 @@ def sample_exponential_noise(eps, size, rng=None):
 
 # Algorithm 1: AboveThreshold
 def laplace(scale):
-    """采样 Laplace(0, scale) 噪声"""
     u = random.random() - 0.5
     return -scale * math.copysign(1.0, u) * math.log(1 - 2 * abs(u))
 
@@ -328,7 +327,6 @@ def unbounded_quantile_mech(x, q, ell, beta, eps1=0.5, eps2=0.5, i_max=None, see
 
 # Private upper bound
 def laplace(scale):
-    """采样 Laplace(0, scale) 噪声"""
     u = random.random() - 0.5
     return -scale * math.copysign(1.0, u) * math.log(1 - 2 * abs(u))
 
