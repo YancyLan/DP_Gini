@@ -1,3 +1,4 @@
+#%%
 from pathlib import Path
 from random import seed
 import sys
@@ -231,6 +232,8 @@ def build_samples_cube(g_real, su_2d, eps_1d, *, gamma=2, n_samples=10_000, rng=
 def save_samples_npz(path, samples, beta_vals, U_vals, eps):
     np.savez(path, samples=samples, beta=beta_vals, U=U_vals, eps=eps)
 
+
+#%%
 if __name__ == "__main__":
     gamma = 2
     eps = [0.5, 1, 2]
@@ -279,3 +282,72 @@ if __name__ == "__main__":
 
     # Plot after all targets have been processed                                                                                                                             
     plot_abs_error_violin_grouped_by_n_then_eps(all_arrays, ci=0.95)
+
+
+# %% Instead of plotting, save to table
+def save_abs_error_to_table(all_array, g_list, eps_list, n_list, output_path="abs_error_stats.csv"):
+    """Compute absolute error statistics (RMSE and 99% CI) and save to CSV."""
+    eps_idx = {e: i for i, e in enumerate(eps_list)}
+    n_idx = {int(n): i for i, n in enumerate(n_list)}
+    
+    rows = []
+    for g in g_list:
+        key = f"samples_laplace_{int(round(g*100)):02d}"
+        if key not in all_array:
+            continue
+        arr = np.asarray(all_array[key])
+        
+        for eps in eps_list:
+            for n_val in n_list:
+                raw = arr[eps_idx[eps], n_idx[int(n_val)], :]
+                mask = np.isfinite(raw) & (raw > 0.0) & (raw < 1.0)
+                valid = raw[mask]
+                
+                if valid.size == 0:
+                    rows.append({'g': g, 'eps': eps, 'n': int(n_val), 
+                                 'rmse': np.nan, 'ci99_lower': np.nan, 'ci99_upper': np.nan})
+                else:
+                    ae = np.abs(valid - g)
+                    ci99_lower = np.percentile(ae, 0)
+                    ci99_upper = np.percentile(ae, 95)
+                    rows.append({
+                        'g': g, 'eps': eps, 'n': int(n_val),
+                        'rmse': np.sqrt(np.mean(ae ** 2)),
+                        'ci99_lower': ci99_lower,
+                        'ci99_upper': ci99_upper
+                    })
+    
+    df = pd.DataFrame(rows)
+    df.to_csv(output_path, index=False)
+    print(f"Saved to {output_path}")
+    return df
+
+
+if __name__ == "__main__":
+    eps = [0.5, 1, 2]
+    beta = [cal_beta(eps=i) for i in eps]
+    n_list = [3000, 10000, 50000, 100000]
+    targets = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    n_samples = 1000000
+    rng = np.random.default_rng(42)
+
+    all_arrays = {}
+    for t in targets:
+        su_df = pd.DataFrame(index=beta, columns=n_list, dtype=float)
+        for n_val in n_list:
+            npy_path = ROOT / "data" / f"dataset_g{t:.1f}_n{n_val}.npy"
+            if not npy_path.exists():
+                print(f"Warning: {npy_path} not found")
+                continue
+            X = np.sort(np.load(npy_path).astype(np.float64))
+            L, U = float(np.nanmin(X)), float(np.nanmax(X))
+            su_df[n_val] = [cal_su_fast(X, beta=b, L=L, U=U) for b in beta]
+
+        samples, *_ = build_samples_cube(g_real=t, su_2d=su_df, eps_1d=eps, 
+                                          gamma=2, n_samples=n_samples, rng=rng)
+        all_arrays[f"samples_laplace_{int(round(t*100)):02d}"] = samples
+
+    output_csv = ROOT / "test" / "abs_error_stats.csv"
+    df = save_abs_error_to_table(all_arrays, targets, eps, n_list, output_csv)
+    print(df.to_string())
+# %%

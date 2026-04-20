@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import math
 import random
+import time
 
 from .utils import sort_X, cal_gini
 
@@ -162,21 +163,24 @@ def cal_beta(eps, gamma =2.5):
     return beta
 
 # calculate smooth upper bound
-def smooth_upper_bound(beta, x) -> float:
+def smooth_upper_bound(beta, x, L, U) -> float:
     n        = x.size
     if n < 2:
         raise ValueError("Need at least two observations")
 
-    L, U     = x[0], x[-1]     # min and max
+    # L, U     = x[0], x[-1]     # min and max
     ave      = x.mean()
     g        = cal_gini(x)
 
-    cand_1 = max((U - L) * (1 - g) / (n * ave + (U -  L)),
+    if n * ave - (U - L) > 0 :
+        cand_1 = max((U - L) * (1 - g) / (n * ave + (U -  L)),
                  2 * (ave - L) / (n * ave))
 
-    cand_2 = max(((U - L) * (g + 1)) / (n * ave - (U - L)),
+        cand_2 = max(((U - L) * (g + 1)) / (n * ave - (U - L)),
                  2 * (U - ave) / (n * ave - (U - L)))
-    cand = max(cand_1, cand_2)
+        cand = max(cand_1, cand_2)
+    else:
+        cand = 1
     return math.exp(-beta*1)*min(cand, 1)
 
 # Calibrate Smooth Upper Bound
@@ -184,7 +188,7 @@ def cal_su(x, beta, L, U):
     
     best = 0
     # calculate the local sensitivity of the Gini index
-    ls_ori = smooth_upper_bound(beta=beta, x=x)
+    ls_ori = smooth_upper_bound(beta=beta, x=x, L=L, U=U)
     best = ls_ori
     print("ls_ori",ls_ori)
     print("beta",beta)
@@ -193,7 +197,9 @@ def cal_su(x, beta, L, U):
     k_m = math.ceil(min(n,k_m))
     print(k_m)
 
+    # record time in each run
     for k in range(1, k_m):
+        t0 = time.time()
         g_M = fast_max_gini(x, k, L, U)
         g_m = fast_min_gini(x, k)
         ave_M = cal_max_ave(x, k, U)
@@ -206,18 +212,22 @@ def cal_su(x, beta, L, U):
         cand = min(cand,1)
         su_k = math.exp(-beta*k)*min(cand, 1)
         best = max(su_k, best)
+        t1 = time.time()
+        print(f"Time for k={k}: {t1 - t0:.6f} seconds")
         print(k, "smooth_upper_bound:", best)
-    return best
+    return best, k_m
 
-def cal_su_fast(x, beta, L, U):
+def cal_su_fast(x, beta, L, U, xm = None):
     beta = float(np.squeeze(beta))
     L    = float(np.squeeze(L))
     U    = float(np.squeeze(U))
-    xm   = float(x.mean())
+    if xm is None:
+        xm   = float(x.mean())
 
     # To ensure the robust of our model
     eta = 1e-12
-    L_safe = L + eta
+    # L_safe must be positive for the ratio check to work correctly
+    L_safe = max(L + eta, eta)
     n = len(x)
     iq = (U - L) / xm
 
@@ -227,6 +237,8 @@ def cal_su_fast(x, beta, L, U):
     best = ls_ori
     # print("ls_ori",ls_ori)
     # rint("beta",beta)
+    if ls_ori <= 0:
+        return 0
     k_m = -math.log(ls_ori)/beta
     k_m = math.ceil(min(n,k_m))
     # print(k_m)

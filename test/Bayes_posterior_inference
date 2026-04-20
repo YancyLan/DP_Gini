@@ -1,0 +1,657 @@
+# %%
+from pathlib import Path
+
+from random import seed
+import sys
+
+from matplotlib.lines import Line2D
+
+ROOT = Path(__file__).resolve().parents[1]   # …/DP_GINI
+sys.path.insert(0, str(ROOT / "src"))
+
+from DPGini.utils import cal_gini, cal_gini, sort_X
+
+import DPGini as dg
+from DPGini.core import (
+    cal_beta, smooth_upper_bound, cal_su_fast, cal_su, sample_eta, add_dp_noise_gini, simulate_noisy_gini, laplace, above_threshold, unbounded_quantile_mech
+)
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import pandas as pd
+from matplotlib.patches import Patch
+from pandas import DataFrame
+import time
+
+
+def make_loglik_phi_power(y_obs: float, scale: float, gamma: float):
+    # phi pdf: f(phi) = C_gamma / (1 + |phi|^gamma), gamma>1
+    g = float(gamma)
+    if g <= 1.0:
+        raise ValueError("gamma must be > 1 for normalization")
+
+    # log C_gamma = log(gamma) - log(2*pi) + log(sin(pi/gamma))
+    logC = np.log(g) - np.log(2.0 * np.pi) + np.log(np.sin(np.pi / g))
+
+    # y|theta uses change-of-variables: divide by scale
+    c0 = logC - np.log(scale)
+
+    def log_likelihood(theta_vec: np.ndarray) -> np.ndarray:
+        u = (y_obs - np.asarray(theta_vec)) / scale
+        return c0 - np.log1p(np.abs(u) ** g)  # <-- key fix
+
+    return log_likelihood
+
+
+def sample_prior_g(N, rng=None):
+    rng = rng or np.random.default_rng()
+    return rng.uniform(0.0, 1.0, size=N)
+
+
+def bayes_posterior_SIR_uniform(y_obs, gamma, eps, smooth_upper_bound,
+                               N=200_000, M=10_000, rng=None):
+    rng = rng or np.random.default_rng()
+    g_prop = sample_prior_g(N, rng)
+
+    scale = (4.0 * gamma / eps) * smooth_upper_bound
+    log_likelihood = make_loglik_phi_power(y_obs, scale, gamma)
+
+    ll = log_likelihood(g_prop)
+    ll -= ll.max()
+    w = np.exp(ll)
+    p = w / w.sum()
+
+    idx = rng.choice(N, size=M, replace=True, p=p)
+    return g_prop[idx]
+
+def posterior_g_normal(y_obs, gamma, eps, smooth_upper_bound, mu, sigma, N=200_000, M=10_000, rng=None):
+    rng = np.random.default_rng(rng)
+    scale = (4 * gamma / eps) * smooth_upper_bound  # Laplace b
+
+    inv_b = 1.0 / scale
+    inv_s2 = 1.0 / (sigma * sigma)
+
+    def logpost(x: float) -> float:
+        # log p(y_obs | x) + log p(x), up to additive constants
+        return -abs(y_obs - x) * inv_b - 0.5 * (x - mu) * (x - mu) * inv_s2
+
+    # Slice sampling (robust for Laplace likelihood * Normal prior)
+    w, m, burn, thin = 1.0 * sigma, 100, 1_000, 1
+    x = float(y_obs)  # init
+    samples = np.empty(M, dtype=float)
+    kept = 0
+    it = 0
+
+    while kept < M:
+        it += 1
+        lp_x = logpost(x)
+        logy = lp_x - rng.exponential(1.0)
+
+        # bracket [L, R]
+        u = rng.random()
+        L = x - w * u
+        R = L + w
+        j = int(rng.integers(0, m))
+        k = (m - 1) - j
+        while j > 0 and logpost(L) > logy:
+            L -= w
+            j -= 1
+        while k > 0 and logpost(R) > logy:
+            R += w
+            k -= 1
+
+        # shrinkage
+        while True:
+            x_new = L + (R - L) * rng.random()
+            if logpost(x_new) >= logy:
+                x = x_new
+                break
+            if x_new < x:
+                L = x_new
+            else:
+                R = x_new
+
+        if it > burn and ((it - burn) % thin == 0):
+            samples[kept] = x
+            kept += 1
+
+    return samples
+
+
+# def posterior_g_trunc_normal(y_obs, gamma, eps, smooth_upper_bound, mu, sigma, a, b,
+#                        N=200_000, M=10_000, rng=None):
+#     rng = np.random.default_rng(rng)
+#     scale = (4 * gamma / eps) * smooth_upper_bound  # Laplace b
+
+#     inv_b = 1.0 / scale
+#     inv_s2 = 1.0 / (sigma * sigma)
+
+#     def logpost(x: float) -> float:
+#         if x < a or x > b:
+#             return -np.inf
+#         # log p(y_obs | x) + log p(x), up to constants
+#         return -abs(y_obs - x) * inv_b - 0.5 * (x - mu) * (x - mu) * inv_s2
+
+#     # Slice sampling within [a, b]
+#     w, m, burn, thin = 1.0 * sigma, 100, 1_000, 1
+#     x = float(np.clip(y_obs, a, b))  # init inside support
+#     samples = np.empty(M, dtype=float)
+#     kept = 0
+#     it = 0
+
+#     while kept < M:
+#         it += 1
+#         lp_x = logpost(x)
+#         logy = lp_x - rng.exponential(1.0)
+
+#         # initial bracket, clipped to [a,b]
+#         u = rng.random()
+#         L = max(a, x - w * u)
+#         R = min(b, L + w)
+
+#         # stepping-out, respecting [a,b]
+#         j = int(rng.integers(0, m))
+#         k = (m - 1) - j
+#         while j > 0 and L > a and logpost(L) > logy:
+#             L = max(a, L - w)
+#             j -= 1
+#         while k > 0 and R < b and logpost(R) > logy:
+#             R = min(b, R + w)
+#             k -= 1
+
+#         # shrinkage
+#         while True:
+#             x_new = L + (R - L) * rng.random()  # always in [a,b]
+#             if logpost(x_new) >= logy:
+#                 x = x_new
+#                 break
+#             if x_new < x:
+#                 L = x_new
+#             else:
+#                 R = x_new
+
+#         if it > burn and ((it - burn) % thin == 0):
+#             samples[kept] = x
+#             kept += 1
+
+#     return samples
+
+def posterior_g_trunc_normal(y_obs, gamma, eps, smooth_upper_bound,
+                                 mu, sigma, a, b,
+                                 M=10_000, rng=None):
+    rng = np.random.default_rng(rng)
+
+    g = float(gamma)
+    if g <= 1.0:
+        raise ValueError("gamma must be > 1")
+
+    s = (4.0 * g / eps) * smooth_upper_bound
+    inv_s2 = 1.0 / (sigma * sigma)
+
+    def logpost(x: float) -> float:
+        if x < a or x > b:
+            return -np.inf
+        u = abs((y_obs - x) / s)
+        ll = -np.log1p(u ** g)          # correct likelihood for 1/(1+|u|^gamma)
+        lp = -0.5 * (x - mu) ** 2 * inv_s2  # truncated normal prior (const ignored)
+        return ll + lp
+
+    # Slice sampling within [a, b]
+    w, m, burn, thin = 1.0 * sigma, 100, 1_000, 1
+    x = float(np.clip(y_obs, a, b))
+    samples = np.empty(M, dtype=float)
+
+    kept = 0
+    it = 0
+    while kept < M:
+        it += 1
+        lp_x = logpost(x)
+        logy = lp_x - rng.exponential(1.0)
+
+        # initial bracket
+        u0 = rng.random()
+        L = max(a, x - w * u0)
+        R = min(b, L + w)
+
+        # stepping out
+        j = int(rng.integers(0, m))
+        k = (m - 1) - j
+        while j > 0 and L > a and logpost(L) > logy:
+            L = max(a, L - w)
+            j -= 1
+        while k > 0 and R < b and logpost(R) > logy:
+            R = min(b, R + w)
+            k -= 1
+
+        # shrinkage
+        while True:
+            x_new = L + (R - L) * rng.random()
+            if logpost(x_new) >= logy:
+                x = x_new
+                break
+            if x_new < x:
+                L = x_new
+            else:
+                R = x_new
+
+        if it > burn and ((it - burn) % thin == 0):
+            samples[kept] = x
+            kept += 1
+
+    return samples
+
+def dp_mean(x, L, U, eps, rng=None):
+    x = np.asarray(x, dtype=float)
+    x = np.clip(x, L, U)
+    m = float(x.mean())
+    n = x.size
+    scale = (U - L) / (n * eps)
+    noise = float(rng.laplace(loc=0.0, scale=scale))
+    return m + noise
+
+
+# %%
+if __name__ == "__main__":
+
+    # Load personal income data--------------------------------------------------------------
+    path = ROOT / "data" / "asecpub24csv"/ f"pppub24.csv"
+    
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = [c.upper() for c in df.columns]
+    cols = [c for c in ["PH_SEQ","PPPOS","A_AGE","MARSUPWT","PTOTVAL"] if c in df.columns]
+    d = df[cols].copy()
+    del df
+
+    # Coerce numerics
+    for c in ["A_AGE","MARSUPWT","PTOTVAL"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+
+    # Sensible filters:
+    # - Age 15+ (income universe)
+    # - Positive person weight (represents population; 0-weight rows add nothing)
+    # - PTOTVAL not missing (keep 0 = no income; keep negatives = losses)
+    mask = (
+        (d["A_AGE"] >= 18) &
+        (d["MARSUPWT"] > 0) &
+        (d["PTOTVAL"].notna())
+    )
+
+
+    df_clean = d[mask].copy()
+    df_clean = df_clean[df_clean["PTOTVAL"] >= 0]
+
+    s = pd.to_numeric(df_clean["PTOTVAL"], errors="coerce")
+    min_all = s.min()
+    max_all = s.max()
+    mean_all = s.mean()
+    X = np.sort(s.to_numpy(dtype=np.float64, copy=False))
+    g_real = cal_gini(X)
+    print("PTOTVAL min:", min_all)
+    print("PTOTVAL max:", max_all)
+    print("PTOTVAL mean:", mean_all)
+    print("Gini of the real dataset", g_real)
+    rate = max_all / mean_all
+    print("Max/mean ratio:", rate)
+
+#%%
+    # household data----------------------------------------------
+    path_hh = ROOT / "data" / "asecpub24csv"/ f"hhpub24.csv"
+    hh = pd.read_csv(path_hh, low_memory=False)
+    hh = hh.query("HRECORD == 1 and H_HHTYPE == 1 and HRHTYPE < 9")
+
+    hh["w"] = hh["HSUP_WGT"] / 100.0  
+    income = hh["HTOTVAL"]
+    weights = hh["w"]
+
+    X = np.sort(hh["HTOTVAL"].to_numpy(dtype=np.float64, copy=False))
+    g_real = cal_gini(X)
+    min_all = X.min()
+    max_all = X.max()
+    #-------------------------------------------------------------
+
+#%%
+
+    eps = 1
+    beta = cal_beta(eps=eps, gamma=2)
+    gamma = 2
+    # n_samples = 100_000
+    L = min(0, min_all)
+    rng = np.random.default_rng(seed=42)
+    
+    X_temp = X - L
+
+    U_multiplier = 2.2  # Changed from 2.5 to 2.2 for tighter bound
+    private_U_raw = unbounded_quantile_mech(
+                 x=X_temp, q=1, ell=min_all, beta=1.5, eps1=0.75, eps2=0.75
+             )[0]
+    U = U_multiplier * private_U_raw
+    print(f"\n=== Private Upper Bound ===")
+    print(f"Private U (raw): {private_U_raw:.2f}")
+    print(f"Multiplier: {U_multiplier}")
+    print(f"Private U (final): {U:.2f}")
+    print(f"True max: {max_all:.2f}")
+    
+    eps_mean = 0.1  # privacy budget for mean (changed from 0.01 to 0.1)
+    mu  = dp_mean(X, L=L, U=U, eps=eps_mean, rng=rng)
+
+    # ---- Analyze DP mean distribution ----
+    # True mean (clipped)
+    X_clipped = np.clip(X, L, U)
+    true_mean = float(X_clipped.mean())
+    n = len(X)
+    scale = (U - L) / (n * eps_mean)  # Laplace scale
+    
+    # Calculate X such that P(dp_mean < X) = 0.01 (1% quantile)
+    # For Laplace: P(X < x) = 0.5 * exp((x - loc) / scale) when x < loc
+    # 0.5 * exp((X - true_mean) / scale) = 0.01
+    # X = true_mean + scale * ln(0.02)
+    X_001 = true_mean + scale * np.log(0.02)
+    
+    print(f"\n=== DP Mean Distribution Analysis ===")
+    print(f"True mean (clipped): {true_mean:.2f}")
+    print(f"DP mean (observed):  {mu:.2f}")
+    print(f"Laplace scale:       {scale:.2f}")
+    print(f"X where P(dp_mean < X) = 0.01: {X_001:.2f}")
+    print(f"Difference from true mean: {X_001 - true_mean:.2f}")
+    
+    # Visualize the distribution
+
+
+    # ---- Use X_001 as conservative private mean for DP Gini release ----
+    print(f"\n=== DP Gini Release using X_001 as Private Mean ===")
+    print(f"Using conservative mean X_001 = {X_001:.2f} (P(dp_mean < X) = 0.01)")
+    print(f"Observed DP mean mu = {mu:.2f}")
+    print(f"L = {L}, U = {U}, n = {len(X)}")
+    
+    # Debug: manually trace cal_su_fast logic for both cases
+    print("\n--- Debug cal_su_fast for X_001 ---")
+    iq_X001 = (U - L) / X_001
+    print(f"iq (X_001) = (U-L)/xm = {iq_X001:.4f}")
+    ls_ori_X001 = 2 / (len(X) * (1/iq_X001) - 1)
+    print(f"ls_ori (X_001) = 2/(n*(1/iq)-1) = {ls_ori_X001:.8f}")
+    
+    print("\n--- Debug cal_su_fast for mu ---")
+    iq_mu = (U - L) / mu
+    print(f"iq (mu) = (U-L)/xm = {iq_mu:.4f}")
+    ls_ori_mu = 2 / (len(X) * (1/iq_mu) - 1)
+    print(f"ls_ori (mu) = 2/(n*(1/iq)-1) = {ls_ori_mu:.8f}")
+    
+    # Calculate smooth upper bound using X_001 as the private mean
+    su_X001 = cal_su_fast(X, beta=beta, L=L, U=U, xm=X_001)
+    print(f"\nSmooth Upper Bound (using X_001): {su_X001:.6f}")
+    
+    # For comparison, also compute with observed DP mean
+    su_mu = cal_su_fast(X, beta=beta, L=L, U=U, xm=mu)
+    print(f"Smooth Upper Bound (using observed mu): {su_mu:.6f}")
+    
+    # Simulate DP Gini distribution using X_001-based smooth upper bound
+    n_sim = 100000
+    noisy_gini_samples_X001 = simulate_noisy_gini(
+        gini_true=g_real,
+        S_value=su_X001,
+        epsilon=eps,
+        gamma=gamma,
+        n_samples=n_sim,
+        rng=rng
+    )
+    
+    # Calculate 95% range (2.5th to 97.5th percentile)
+    ci_lo_X001, ci_hi_X001 = np.percentile(noisy_gini_samples_X001, [2.5, 97.5])
+    mean_noisy_X001 = np.mean(noisy_gini_samples_X001)
+    
+    print(f"\n--- DP Gini Release Statistics (using X_001 mean) ---")
+    print(f"True Gini:           {g_real:.4f}")
+    print(f"Mean of DP Gini:     {mean_noisy_X001:.4f}")
+    print(f"95% Range:           [{ci_lo_X001:.4f}, {ci_hi_X001:.4f}]")
+    print(f"95% Range Width:     {ci_hi_X001 - ci_lo_X001:.4f}")
+    
+
+
+    # ---- Posterior Inference using X_001 (1% quantile) as private mean ----
+    print(f"\n=== Posterior Inference using X_001 (1% quantile) ===")
+    print(f"Smooth Upper Bound (X_001): {su_X001:.6f}")
+    
+    # Generate a single noisy Gini observation using su_X001
+    noisy_gini_X001 = simulate_noisy_gini(
+        gini_true=g_real,
+        S_value=su_X001,
+        epsilon=eps,
+        gamma=gamma,
+        n_samples=1,
+        rng=rng
+    )[0]
+    print(f"Noisy Gini (using X_001): {noisy_gini_X001:.4f}")
+    
+    # Posterior inference under different priors using X_001
+    uni_samples_X001 = bayes_posterior_SIR_uniform(noisy_gini_X001, gamma, eps, su_X001, N=5_000_000, M=1_000_000)
+    g_normal_samples_X001_001 = posterior_g_trunc_normal(noisy_gini_X001, gamma, eps, su_X001, mu=0.4865, sigma=0.01, a=0.0, b=1.0, M=1_000_000)
+    g_normal_samples_X001_01 = posterior_g_trunc_normal(noisy_gini_X001, gamma, eps, su_X001, mu=0.4865, sigma=0.1, a=0.0, b=1.0, M=1_000_000)
+    
+    # Summary table for X_001 posteriors
+    posteriors_X001 = {
+        "Uniform Prior": uni_samples_X001,
+        "TruncNormal(σ=0.01, [0,1])": g_normal_samples_X001_001,
+        "TruncNormal(σ=0.1, [0,1])": g_normal_samples_X001_01,
+    }
+    
+    print(f"\n=== Posterior Summary Table (using X_001 as private mean) ===")
+    print(f"True Gini: {g_real:.4f}")
+    print(f"Noisy Gini: {noisy_gini_X001:.4f}")
+    print(f"Smooth Upper Bound: {su_X001:.6f}")
+    
+    summary_rows_X001 = []
+    for name, samples in posteriors_X001.items():
+        mean_val = np.mean(samples)
+        ci_lo, ci_hi = np.percentile(samples, [2.5, 97.5])
+        summary_rows_X001.append({
+            "Prior": name,
+            "Mean": f"{mean_val:.4f}",
+            "95% CI Lower": f"{ci_lo:.4f}",
+            "95% CI Upper": f"{ci_hi:.4f}",
+            "CI Width": f"{ci_hi - ci_lo:.4f}",
+        })
+    
+    df_summary_X001 = pd.DataFrame(summary_rows_X001)
+    print(df_summary_X001.to_string(index=False))
+    # ---- End Posterior Inference using X_001 ----
+
+    # report time of cal_su and cal_su_fast
+    start_time = time.time()
+    su, k = cal_su(X, beta=beta, L=L, U=U)
+    end_time = time.time()
+    print(f"cal_su time: {(end_time - start_time) * 1000:.2f} ms")
+    
+    start_time = time.time()
+    su_for_post_infer = cal_su_fast(X, beta=beta, L=L, U=U, xm = mu)
+    end_time = time.time()
+    print(f"cal_su_fast time: {(end_time - start_time) * 1000:.2f} ms")
+    noisy_gini = simulate_noisy_gini(
+        gini_true=g_real,
+        S_value=su,
+        epsilon=eps,
+        gamma=gamma,
+        n_samples=1,   
+        rng=rng
+            )
+#%%
+    print(su_for_post_infer, su, k,g_real, noisy_gini)
+
+#%%
+    # Posterior inference
+# bayes_posterior_SIR_uniform(y_obs, gamma, eps, smooth_upper_bound, N=200_000, M=10_000, rng=None)
+    uni_samples = bayes_posterior_SIR_uniform(noisy_gini, gamma, eps, su, N = 5_000_000,M =1_000_000)
+    g_normal_samples = posterior_g_trunc_normal(noisy_gini, gamma, eps, su, mu=0.4865, sigma= 0.01, a=0.0, b=1.0, M=1_000_000)
+    g_normal_samples_01 = posterior_g_trunc_normal(noisy_gini, gamma, eps, su, mu=0.4865, sigma= 0.1, a=0.0, b=1.0, M=1_000_000)
+    # g_normal_samples_001 = posterior_g_trunc_normal(noisy_gini, gamma, eps, su_for_post_infer, mu=0.55, sigma= 0.01, a=0.0, b=1.0, M=1_000_000)
+    # g_normal_samples_056 = posterior_g_trunc_normal(noisy_gini, gamma, eps, su_for_post_infer, mu=0.55, sigma= 0.1, a=0.5, b=0.6, M=1_000_000)
+    # draw posterior distribution with g_real, noisy_gini and 95% Interval
+    # 95% Interval
+    # x_axis to 0.4 - 0.7
+    # use a table to show the mean and 95% CI of each posterior distribution
+
+    # Summary table of posterior distributions
+    posteriors = {
+        "Uniform Prior": uni_samples,
+        "TruncNormal(σ=0.01, [0,1])": g_normal_samples,
+         "TruncNormal(σ=0.1, [0,1])": g_normal_samples_01,
+        # "TruncNormal(σ=0.01, [0,1])": g_normal_samples_001,
+        # "TruncNormal(σ=0.1, [0.5,0.6])": g_normal_samples_056,
+    }
+
+    summary_rows = []
+    for name, samples in posteriors.items():
+        mean_val = np.mean(samples)
+        ci_lo, ci_hi = np.percentile(samples, [5, 95])
+        summary_rows.append({
+            "Prior": name,
+            "Mean": f"{mean_val:.4f}",
+            "95% CI Lower": f"{ci_lo:.4f}",
+            "95% CI Upper": f"{ci_hi:.4f}",
+            "CI Width": f"{ci_hi - ci_lo:.4f}"
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    print("\n=== Posterior Summary Table ===")
+    print(f"True Gini: {g_real:.4f}")
+    print(f"Noisy Gini: {noisy_gini[0]:.4f}")
+    print(summary_df.to_string(index=False))
+
+
+#%% test posterior_g_normal
+    xmin, xmax = 0.45, 0.65
+    bins = np.linspace(xmin, xmax, 301)
+
+    fig, ax = plt.subplots(figsize=(8,4))
+
+    posters = [
+        (uni_samples, "g_uniform", "C0"),
+        (g_normal_samples, "g_normal", "C1"),
+        (g_trunc_normal_samples, "g_trunc_normal", "C2"),
+    ]
+
+    # 画分布（轮廓直方图）
+    for s, name, c in posters:
+        ax.hist(s, bins=bins, density=True, histtype="step", linewidth=2, color=c, label=name)
+
+        # 95% CI（两条细竖线，同色、不同线型）
+        lo, hi = np.percentile(s, [5, 95])
+        ax.axvline(lo, color=c, linestyle="-", linewidth=1.2, alpha=0.9)
+        ax.axvline(hi, color=c, linestyle="-", linewidth=1.2, alpha=0.9)
+
+    # 真值 / 噪声（用中性色，不抢戏）
+    ax.axvline(g_real, color="k", linestyle="--", linewidth=1.4, label="Actual Gini")
+    ax.axvline(noisy_gini, color="0.4", linestyle=":", linewidth=1.4, label="Noisy Gini")
+
+    ax.set_xlim(xmin, xmax)
+    ax.set_xlabel("Gini index")
+    ax.set_ylabel("Posterior density")
+    # ax.set_title("Posterior distribution of the Gini index")
+
+    # ---- 图例：只解释“CI 线型代表 95%CI”，不要给每个 lo/hi 都单独占一项 ----
+    handles, labels = ax.get_legend_handles_labels()
+    ci_proxy = Line2D([0],[0], color="0.2", linestyle="-", linewidth=1.2, label="95% Posterior Credible Interval")
+    ax.legend(handles + [ci_proxy], labels + ["95% Posterior Credible Interval"],
+            loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3)
+
+    plt.show()
+
+
+
+
+    
+    #%%
+    from matplotlib.lines import Line2D
+    # Different N run time, subsample from X (with 1500 samples )
+    N_values = [10_000, 10_000, 10_000,50_000, 50_000, 50_000, 100_000, 100_000, 100_000]
+    # create a df to store time 
+    time_df = pd.DataFrame(columns=["N", "k", "cal_su time(ms)", "cal_su_fast time(ms)", "speedup(ms)"])
+    for N in N_values:
+        X_sub = rng.choice(X, size=N, replace=False)
+        L = 0
+        # Shift X to start from L
+        X_temp = X_sub - L
+        U = 2.5 * unbounded_quantile_mech(
+                 x=X_temp, q=1, ell=min_all, beta=1.5, eps1=0.75, eps2=0.75
+             )[0]
+        
+        g_sub = cal_gini(X_sub)
+
+        t0 = time.perf_counter()
+        su,k = cal_su(X_sub, beta=beta, L=L, U=U)
+        t1 = time.perf_counter()
+
+        t_su = t1 - t0
+
+        t0 = time.perf_counter()
+        su_fast = cal_su_fast(X_sub, beta=beta, L=L, U=U)
+        t1 = time.perf_counter()
+
+        t_su_fast = t1 - t0
+
+        time_df = pd.concat([time_df, pd.DataFrame([{
+            "N": N,
+            "k": k,
+            "cal_su time(ms)": t_su * 1000,
+            "cal_su_fast time(ms)": t_su_fast * 1000,
+            "speedup(ms)": t_su - t_su_fast
+        }])], ignore_index=True)
+
+    # Order the DataFrame first by N then by k
+    time_df = time_df.sort_values(by=["N", "k"]).reset_index(drop=True)
+
+
+
+
+
+
+
+
+# %%
+    # Vary N
+    del time_df
+    time_df = pd.DataFrame(columns=["N", "k", "cal_su time(ms)", "cal_su_fast time(ms)", "speedup(ms)"])
+    # repeat each N four times
+    repeat = 10
+    N_values = [10_000, 25_000,50_000, 75_000, 100_000]
+
+    N_values = N_values * repeat
+
+    for N in N_values:
+        X_sub = rng.choice(X, size=N, replace=False)
+        L = 0
+        # Shift X to start from L
+        X_temp = X_sub - L
+        U = 2.5 * unbounded_quantile_mech(
+                 x=X_temp, q=1, ell=min_all, beta=1.5, eps1=0.75, eps2=0.75
+             )[0]
+        
+        g_sub = cal_gini(X_sub)
+
+        t0 = time.perf_counter()
+        su,k = cal_su(X_sub, beta=beta, L=L, U=U)
+        t1 = time.perf_counter()
+
+        t_su = t1 - t0
+
+        t0 = time.perf_counter()
+        su_fast = cal_su_fast(X_sub, beta=beta, L=L, U=U)
+        t1 = time.perf_counter()
+
+        t_su_fast = t1 - t0
+        time_df = pd.concat([time_df, pd.DataFrame([{
+            "N": N,
+            "k": k,
+            "cal_su time(ms)": t_su * 1000,
+            "cal_su_fast time(ms)": t_su_fast * 1000,
+            "speedup(ms)": (t_su - t_su_fast) * 1000
+        }])], ignore_index=True)
+
+    # Order the DataFrame first by N then by k
+    time_df = time_df.sort_values(by=["N", "k"]).reset_index(drop=True)
+
+
+# %%
+    print(time_df)
+# %%
